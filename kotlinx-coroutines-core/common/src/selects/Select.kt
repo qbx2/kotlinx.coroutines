@@ -213,6 +213,7 @@ internal class SeqNumber {
     fun next() = number.incrementAndGet()
 }
 
+@SharedImmutable
 private val selectOpSequenceNumber = SeqNumber()
 
 @PublishedApi
