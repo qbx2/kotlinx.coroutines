@@ -249,7 +249,7 @@ internal class CoroutineScheduler(
 
     private inline fun createdWorkers(state: Long): Int = (state and CREATED_MASK).toInt()
     private inline fun blockingTasks(state: Long): Int = (state and BLOCKING_MASK shr BLOCKING_SHIFT).toInt()
-    public inline fun availablePermits(state: Long): Int = (state and CPU_PERMITS_MASK shr CPU_PERMITS_SHIFT).toInt()
+    public inline fun availableCpuPermits(state: Long): Int = (state and CPU_PERMITS_MASK shr CPU_PERMITS_SHIFT).toInt()
 
     // Guarded by synchronization
     private inline fun incrementCreatedWorkers(): Int = createdWorkers(controlState.incrementAndGet())
@@ -264,7 +264,7 @@ internal class CoroutineScheduler(
     private inline fun tryAcquireCpuPermit(): Boolean {
         while (true) {
             val state = controlState.value
-            val available = availablePermits(state)
+            val available = availableCpuPermits(state)
             if (available == 0) return false
             val update = state - (1L shl CPU_PERMITS_SHIFT)
             if (controlState.compareAndSet(state, update)) return true
@@ -286,6 +286,7 @@ internal class CoroutineScheduler(
         private const val FORBIDDEN = -1
         private const val ALLOWED = 0
         private const val TERMINATED = 1
+        private const val PARKED = 1
 
         // Masks of control state
         private const val BLOCKING_SHIFT = 21 // 2M threads max
@@ -394,7 +395,7 @@ internal class CoroutineScheduler(
     internal fun signalCpuWork() {
         if (tryUnpark()) return
         if (tryCreateWorker()) return
-        tryUnpark() // Try unpark again in case there was race between permit release and parking
+        tryUnpark()
     }
 
     private fun tryCreateWorker(state: Long = controlState.value): Boolean {
@@ -418,12 +419,10 @@ internal class CoroutineScheduler(
     private fun tryUnpark(): Boolean {
         while (true) {
             val worker = parkedWorkersStackPop() ?: return false
-            val time = worker.minDelayUntilStealableTask // TODO explain
-            worker.parkingAllowed = false
-            if (worker.signallingAllowed && time == 0L) {
+            if (!worker.parkingState.compareAndSet(ALLOWED, FORBIDDEN)) {
                 LockSupport.unpark(worker)
             }
-            if (time == 0L && worker.tryForbidTermination()) return true
+            if (worker.tryForbidTermination()) return true
         }
     }
 
@@ -472,7 +471,7 @@ internal class CoroutineScheduler(
         // Do not add CPU tasks in local queue if we are not able to execute it
         // TODO discuss: maybe add it to the local queue and offload back in the global queue iff permit wasn't acquired?
         if (task.mode == TaskMode.NON_BLOCKING && worker.isBlocking) {
-           return task
+            return task
         }
         return worker.localQueue.add(task, fair = fair)
     }
@@ -485,16 +484,16 @@ internal class CoroutineScheduler(
      *
      * State of the queues:
      * b for blocking, c for CPU, r for retiring.
-     * E.g. for [1b, 1b, 2c, 1r] means that pool has
+     * E.g. for [1b, 1b, 2c, 1d] means that pool has
      * two blocking workers with queue size 1, one worker with CPU permit and queue size 1
-     * and one retiring (executing his local queue before parking) worker with queue size 1.
+     * and one dormant (executing his local queue before parking) worker with queue size 1.
      * TODO revisit
      */
     override fun toString(): String {
         var parkedWorkers = 0
         var blockingWorkers = 0
         var cpuWorkers = 0
-        var retired = 0
+        var dormant = 0
         var terminated = 0
         val queueSizes = arrayListOf<String>()
         for (index in 1 until workers.length()) {
@@ -511,8 +510,8 @@ internal class CoroutineScheduler(
                     queueSizes += queueSize.toString() + "c" // CPU
                 }
                 WorkerState.DORMANT -> {
-                    ++retired
-                    if (queueSize > 0) queueSizes += queueSize.toString() + "r" // Retiring
+                    ++dormant
+                    if (queueSize > 0) queueSizes += queueSize.toString() + "d" // Retiring
                 }
                 WorkerState.TERMINATED -> ++terminated
             }
@@ -526,18 +525,19 @@ internal class CoroutineScheduler(
                     "CPU = $cpuWorkers, " +
                     "blocking = $blockingWorkers, " +
                     "parked = $parkedWorkers, " +
-                    "retired = $retired, " +
+                    "retired = $dormant, " +
                     "terminated = $terminated}, " +
                 "running workers queues = $queueSizes, "+
                 "global CPU queue size = ${globalCpuQueue.size}, " +
                 "global blocking queue size = ${globalBlockingQueue.size}, " +
                 "Control State Workers {" +
                     "created = ${createdWorkers(state)}, " +
-                "blocking = ${blockingTasks(state)}}" +
-                "]"
+                    "blocking = ${blockingTasks(state)}, " +
+                    "CPU acquired = ${corePoolSize - availableCpuPermits(state)}" +
+                "}]"
     }
 
-    internal fun runSafely(task: Task) {
+    fun runSafely(task: Task) {
         try {
             task.run()
         } catch (e: Throwable) {
@@ -605,11 +605,15 @@ internal class CoroutineScheduler(
          */
         @Volatile
         var nextParkedWorker: Any? = NOT_IN_STACK
-        @Volatile // TODO ughm don't ask
-        var parkingAllowed = false
-        @Volatile
-        var signallingAllowed = false
 
+        /*
+         * The delay until at least one task in other worker queues will  become stealable.
+         */
+        private var minDelayUntilStealableTaskNs = 0L
+        // ALLOWED | PARKED | FORBIDDEN
+        val parkingState = atomic(ALLOWED)
+
+        private var rngState = Random.nextInt()
         /**
          * Tries to set [terminationState] to [FORBIDDEN], returns `false` if this attempt fails.
          * This attempt may fail either because worker terminated itself or because someone else
@@ -643,69 +647,75 @@ internal class CoroutineScheduler(
 
         /**
          * Releases CPU token if worker has any and changes state to [newState].
-         * Returns `true` if the last CPU permit was successfully returned
+         * Returns `true` if CPU permit was returned to the pool
          */
         internal fun tryReleaseCpu(newState: WorkerState): Boolean {
             val previousState = state
             val hadCpu = previousState == WorkerState.CPU_ACQUIRED
-            val ctlState = if (hadCpu) {
-                releaseCpuPermit()
-            } else {
-                0L
-            }
+            if (hadCpu) releaseCpuPermit()
             if (previousState != newState) state = newState
-            return hadCpu && availablePermits(ctlState) == 1
+            return hadCpu
         }
-
-        private var rngState = Random.nextInt()
-        /*
-         * The delay until at least one task in other worker queues will  become stealable.
-         * Volatile to avoid benign data-race
-         */
-        @Volatile
-        public var minDelayUntilStealableTask = 0L
 
         override fun run() = runWorker()
 
         private fun runWorker() {
+            var rescanned = false
             while (!isTerminated && state != WorkerState.TERMINATED) {
                 val task = findTask()
                 // Task found. Execute and repeat
                 if (task != null) {
+                    rescanned = false
+                    minDelayUntilStealableTaskNs = 0L
                     executeTask(task)
                     continue
                 }
-
                 /*
                  * No tasks were found:
                  * 1) Either at least one of the workers has stealable task in its FIFO-buffer with a stealing deadline.
                  *    Then its deadline is stored in [minDelayUntilStealableTask]
+                 *
+                 * Then just park for that duration (ditto re-scanning).
+                 *  While it could potentially lead to short (up to WORK_STEALING_TIME_RESOLUTION_NS ns) starvations,
+                 * excess unparks and managing "one unpark per signalling" invariant become unfeasible, instead we are going to resolve
+                 * it with "spinning via scans" mechanism.
+                 */
+                if (minDelayUntilStealableTaskNs != 0L) {
+                    if (!rescanned) {
+                        rescanned = true
+                        continue
+                    } else {
+                        tryReleaseCpu(WorkerState.PARKING)
+                        LockSupport.parkNanos(minDelayUntilStealableTaskNs)
+                        minDelayUntilStealableTaskNs = 0L
+                    }
+                }
+                /*
                  * 2) No tasks available, time to park and, potentially, shut down the thread.
                  *
-                 * In both cases, worker adds itself to the stack of parked workers, re-scans all the queues
+                 * Add itself to the stack of parked workers, re-scans all the queues
                  * to avoid missing wake-up (requestCpuWorker) and either starts executing discovered tasks or parks itself awaiting for new tasks.
-                 *
-                 * Park duration depends on the possible state: either this is the idleWorkerKeepAliveNs or stealing deadline.
                  */
-                parkingAllowed = true
+                parkingState.value = ALLOWED
                 if (parkedWorkersStackPush(this)) {
                     continue
                 } else {
-                    signallingAllowed = true
-                    if (parkingAllowed) {
-                        tryReleaseCpu(WorkerState.PARKING)
-                        if (minDelayUntilStealableTask > 0) {
-                            LockSupport.parkNanos(minDelayUntilStealableTask)  // No spurious wakeup check here
-                        } else {
-                            assert { localQueue.size == 0 }
-                            park()
+                    assert { localQueue.size == 0 }
+                    tryReleaseCpu(WorkerState.PARKING)
+                    interrupted() // Cleanup interruptions
+                    while (inStack()) { // Prevent spurious wakeups
+                        if (isTerminated) break
+                        if (!parkingState.compareAndSet(ALLOWED, PARKED)) {
+                            break
                         }
+                        park()
                     }
-                    signallingAllowed = false
                 }
             }
             tryReleaseCpu(WorkerState.TERMINATED)
         }
+
+        private fun inStack(): Boolean = nextParkedWorker !== NOT_IN_STACK
 
         private fun executeTask(task: Task) {
             val taskMode = task.mode
@@ -716,16 +726,10 @@ internal class CoroutineScheduler(
         }
 
         private fun beforeTask(taskMode: TaskMode) {
-            if (taskMode != TaskMode.NON_BLOCKING) {
-                if (tryReleaseCpu(WorkerState.BLOCKING)) {
-                    /*
-                     * If we had the very last CPU token, it means that no other thread could
-                     * have stolen CPU tasks (next to current blocking tasks) from our queue,
-                     * signal work to unpark such thread.
-                     */
-                    signalCpuWork()
-                }
-                return
+            if (taskMode == TaskMode.NON_BLOCKING) return
+            // Always notify about new work when releasing CPU-permit to execute some blocking task
+            if (tryReleaseCpu(WorkerState.BLOCKING)) {
+                signalCpuWork()
             }
         }
 
@@ -763,18 +767,13 @@ internal class CoroutineScheduler(
             // set termination deadline the first time we are here (it is reset in idleReset)
             if (terminationDeadline == 0L) terminationDeadline = System.nanoTime() + idleWorkerKeepAliveNs
             // actually park
-            if (!doPark(idleWorkerKeepAliveNs)) return
+            LockSupport.parkNanos(idleWorkerKeepAliveNs)
             // try terminate when we are idle past termination deadline
             // note that comparison is written like this to protect against potential nanoTime wraparound
             if (System.nanoTime() - terminationDeadline >= 0) {
                 terminationDeadline = 0L // if attempt to terminate worker fails we'd extend deadline again
                 tryTerminateWorker()
             }
-        }
-
-        private fun doPark(nanos: Long): Boolean {
-            LockSupport.parkNanos(nanos) // Spurious wakeup check in [park]
-            return true
         }
 
         /**
@@ -844,7 +843,7 @@ internal class CoroutineScheduler(
 
         fun findTask(): Task? {
             if (tryAcquireCpuPermit()) return findAnyTask()
-             // If we can't acquire a CPU permit -- attempt to find blocking task
+            // If we can't acquire a CPU permit -- attempt to find blocking task
             val task =  localQueue.poll() ?: globalBlockingQueue.removeFirstOrNull()
             return task ?: trySteal(blockingOnly = true)
         }
@@ -899,7 +898,7 @@ internal class CoroutineScheduler(
                     }
                 }
             }
-            minDelayUntilStealableTask = if (minDelay != Long.MAX_VALUE) minDelay else 0
+            minDelayUntilStealableTaskNs = if (minDelay != Long.MAX_VALUE) minDelay else 0
             return null
         }
     }

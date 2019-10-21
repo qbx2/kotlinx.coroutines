@@ -37,7 +37,7 @@ class CoroutineSchedulerStressTest : TestBase() {
 
     @Test
     fun testInternalTasksSubmissionProgress() {
-        /*
+      /*
        * Run a lot of tasks and validate that
        * 1) All of them are completed successfully
        * 2) Every thread executed task at least once

@@ -56,7 +56,7 @@ class CoroutineDispatcherTest : SchedulerTestBase() {
     fun testStealing() = runBlocking {
         corePoolSize = 2
         val flag = AtomicBoolean(false)
-        val job = async(context = dispatcher) {
+        val job = async(dispatcher) {
             expect(1)
             val innerJob = async {
                 expect(2)
@@ -84,29 +84,6 @@ class CoroutineDispatcherTest : SchedulerTestBase() {
         }
         finish(3)
         checkPoolThreadsCreated(2)
-    }
-
-    @Test
-    fun testWithTimeout() = runBlocking {
-        corePoolSize = CORES_COUNT
-        withContext(dispatcher) {
-            expect(1)
-            val result = withTimeoutOrNull(1000) {
-                expect(2)
-                yield() // yield only now
-                "OK"
-            }
-            assertEquals("OK", result)
-            val nullResult = withTimeoutOrNull(1000) {
-                expect(3)
-                while (true) {
-                    yield()
-                }
-            }
-            assertNull(nullResult)
-            finish(4)
-        }
-        checkPoolThreadsCreated(1..CORES_COUNT)
     }
 
     @Test

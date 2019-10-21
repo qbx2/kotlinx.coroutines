@@ -48,7 +48,6 @@ class BlockingCoroutineDispatcherMixedStealingStressTest : SchedulerTestBase() {
         }
     }
 
-
     @Test
     fun testBlockingProgressPreventedExternal()  {
         val blocking = blockingDispatcher(corePoolSize).asExecutor()

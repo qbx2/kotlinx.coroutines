@@ -109,8 +109,8 @@ internal class WorkQueue {
         assert { bufferSize == 0 }
         val task  = victim.pollBuffer()
         if (task != null) {
-            val added = add(task)
-            assert { added == null }
+            val notAdded = add(task)
+            assert { notAdded == null }
             return TASK_STOLEN
         }
         return tryStealLastScheduled(victim, blockingOnly = false)

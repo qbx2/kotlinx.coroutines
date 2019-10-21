@@ -16,7 +16,6 @@ class BlockingCoroutineDispatcherWorkSignallingStressTest : SchedulerTestBase() 
     @Test
     fun testCpuTasksStarvation() = runBlocking {
         val iterations = 1000 * stressTestMultiplier
-
         repeat(iterations) {
             // Create a dispatcher every iteration to increase probability of race
             val dispatcher = ExperimentalCoroutineDispatcher(CORES_COUNT)
@@ -42,10 +41,10 @@ class BlockingCoroutineDispatcherWorkSignallingStressTest : SchedulerTestBase() 
 
             cpuTasks.forEach { require(it.isActive) }
             cpuBarrier.await()
-            cpuTasks.forEach { it.await() }
+            cpuTasks.awaitAll()
             blockingTasks.forEach { require(it.isActive) }
             blockingBarrier.await()
-            blockingTasks.forEach { it.await() }
+            blockingTasks.awaitAll()
             dispatcher.close()
         }
     }
