@@ -716,7 +716,7 @@ internal class CoroutineScheduler(
                     return
                 }
                 while (inStack()) { // Prevent spurious wakeups
-                    if (isTerminated) break
+                    if (isTerminated || state == WorkerState.TERMINATED) break
                     park()
                 }
             }
