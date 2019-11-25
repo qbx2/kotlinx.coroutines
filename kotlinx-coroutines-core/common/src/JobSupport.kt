@@ -534,10 +534,9 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     private fun promoteSingleToNodeList(state: JobNode<*>) {
         // try to promote it to list (SINGLE+ state)
-        val initialList = NodeList()
-        if (!state.addOneIfEmpty(initialList)) {
-            disposeLockFreeLinkedList { initialList }
-        }
+        // Note: on Kotlin/Native we don't have to dispose NodeList() that we've failed to add, since
+        // it does not have cyclic references when addOneIfEmpty fails.
+        state.addOneIfEmpty(NodeList())
         // it must be in SINGLE+ state or state has changed (node could have need removed from state)
         val list = state.nextNode // either our NodeList or somebody else won the race, updated state
         // just attempt converting it to list if state is still the same, then we'll continue lock-free loop
@@ -798,7 +797,11 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         val list = getOrPromoteCancellingList(state) ?: return false
         // Create cancelling state (with rootCause!)
         val cancelling = Finishing(list, false, rootCause)
-        if (!_state.compareAndSet(state, cancelling)) return false
+        if (!_state.compareAndSet(state, cancelling)) {
+            // Dispose if the list was just freshly allocated
+            disposeLockFreeLinkedList { list.takeIf { list !== state.list } }
+            return false
+        }
         // Notify listeners
         notifyCancelling(list, rootCause)
         return true
@@ -894,7 +897,11 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             // We do it as early is possible while still holding the lock. This ensures that we cancelImpl asap
             // (if somebody else is faster) and we synchronize all the threads on this finishing lock asap.
             if (finishing !== state) {
-                if (!_state.compareAndSet(state, finishing)) return COMPLETING_RETRY
+                if (!_state.compareAndSet(state, finishing)) {
+                    // Dispose if the list was just freshly allocated
+                    disposeLockFreeLinkedList { list.takeIf { list !== state.list } }
+                    return COMPLETING_RETRY
+                }
             }
             // ## IMPORTANT INVARIANT: Only one thread (that had set isCompleting) can go past this point
             assert { !finishing.isSealed } // cannot be sealed
