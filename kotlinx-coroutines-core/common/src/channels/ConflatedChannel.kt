@@ -1,11 +1,11 @@
-/*
- * Copyright 2016-2019 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license.
- */
-
 package kotlinx.coroutines.channels
 
-import kotlinx.coroutines.selects.*
-import kotlinx.coroutines.internal.*
+import kotlinx.atomicfu.locks.*
+import kotlinx.coroutines.RESUME_TOKEN
+import kotlinx.coroutines.assert
+import kotlinx.coroutines.internal.RETRY_ATOMIC
+import kotlinx.coroutines.selects.ALREADY_SELECTED
+import kotlinx.coroutines.selects.SelectInstance
 
 /**
  * Channel that buffers at most one element and conflates all subsequent `send` and `offer` invocations,
@@ -15,79 +15,104 @@ import kotlinx.coroutines.internal.*
  * Sender to this channel never suspends and [offer] always returns `true`.
  *
  * This channel is created by `Channel(Channel.CONFLATED)` factory function invocation.
- *
- * This implementation is fully lock-free.
  */
 internal open class ConflatedChannel<E> : AbstractChannel<E>() {
-    protected final override val isBufferAlwaysEmpty: Boolean get() = true
-    protected final override val isBufferEmpty: Boolean get() = true
+    protected final override val isBufferAlwaysEmpty: Boolean get() = false
+    protected final override val isBufferEmpty: Boolean get() = lock.withLock { size == 0 }
     protected final override val isBufferAlwaysFull: Boolean get() = false
-    protected final override val isBufferFull: Boolean get() = false
+    protected final override val isBufferFull: Boolean get() = lock.withLock { size == 1 }
 
-    override fun onClosedIdempotent(closed: LockFreeLinkedListNode) {
-        @Suppress("UNCHECKED_CAST")
-        (closed.prevNode as? SendBuffered<E>)?.let { lastBuffered ->
-            conflatePreviousSendBuffered(lastBuffered)
-        }
-    }
+    val lock = reentrantLock()
 
-    /**
-     * Queues conflated element, returns null on success or
-     * returns node reference if it was already closed or is waiting for receive.
-     */
-    private fun sendConflated(element: E): ReceiveOrClosed<*>? {
-        val node = SendBuffered(element)
-        queue.addLastIfPrev(node) { prev ->
-            if (prev is ReceiveOrClosed<*>) return@sendConflated prev
-            true
-        }
-        conflatePreviousSendBuffered(node)
-        return null
-    }
+    var buffer: E? = null
 
-    private fun conflatePreviousSendBuffered(node: SendBuffered<E>) {
-        // Conflate all previous SendBuffered, helping other sends to conflate
-        var prev = node.prevNode
-        while (prev is SendBuffered<*>) {
-            if (!prev.remove()) {
-                prev.helpRemove()
-            }
-            prev = prev.prevNode
-        }
-    }
+    var size = 0
 
-    // result is always `OFFER_SUCCESS | Closed`
-    protected override fun offerInternal(element: E): Any {
-        while (true) {
-            val result = super.offerInternal(element)
-            when {
-                result === OFFER_SUCCESS -> return OFFER_SUCCESS
-                result === OFFER_FAILED -> { // try to buffer
-                    when (val sendResult = sendConflated(element)) {
-                        null -> return OFFER_SUCCESS
-                        is Closed<*> -> return sendResult
+    // result is `OFFER_SUCCESS | Closed`
+    public override fun offerInternal(element: E): Any {
+        var receive: ReceiveOrClosed<E>? = null
+        lock.withLock {
+            closedForSend?.let { return it }
+            // if there is no element written in buffer
+            if (size == 0) {
+                // check for receivers that were waiting on the empty buffer
+                loop@ while (true) {
+                    receive = takeFirstReceiveOrPeekClosed() ?: break@loop // break when no receivers queued
+                    if (receive is Closed) {
+                        return receive!!
                     }
-                    // otherwise there was receiver in queue, retry super.offerInternal
+                    val token = receive!!.tryResumeReceive(element, null)
+                    if (token != null) {
+                        assert { token === RESUME_TOKEN }
+                        return@withLock
+                    }
                 }
-                result is Closed<*> -> return result
-                else -> error("Invalid offerInternal result $result")
             }
+            size = 1
+            buffer = element
+            return OFFER_SUCCESS
         }
+        // breaks here if offer meets receiver
+        receive!!.completeResumeReceive(element)
+        return receive!!.offerResult
     }
 
-    // result is always `ALREADY_SELECTED | OFFER_SUCCESS | Closed`.
+    // result is `ALREADY_SELECTED | OFFER_SUCCESS | Closed`
     protected override fun offerSelectInternal(element: E, select: SelectInstance<*>): Any {
-        while (true) {
-            val result = if (hasReceiveOrClosed)
-                super.offerSelectInternal(element, select) else
-                (select.performAtomicTrySelect(describeSendConflated(element)) ?: OFFER_SUCCESS)
-            when {
-                result === ALREADY_SELECTED -> return ALREADY_SELECTED
-                result === OFFER_SUCCESS -> return OFFER_SUCCESS
-                result === OFFER_FAILED -> {} // retry
-                result === RETRY_ATOMIC -> {} // retry
-                result is Closed<*> -> return result
-                else -> error("Invalid result $result")
+        var receive: ReceiveOrClosed<E>? = null
+        lock.withLock {
+            closedForSend?.let { return it }
+            if (size == 0) {
+                loop@ while (true) {
+                    val offerOp = describeTryOffer(element)
+                    val failure = select.performAtomicTrySelect(offerOp)
+                    when {
+                        failure == null -> { // offered successfully
+                            receive = offerOp.result
+                            return@withLock
+                        }
+                        failure === OFFER_FAILED -> break@loop // cannot offer -> Ok to queue to buffer
+                        failure === RETRY_ATOMIC -> {} // retry
+                        failure === ALREADY_SELECTED || failure is Closed<*> -> return failure
+                        else -> error("performAtomicTrySelect(describeTryOffer) returned $failure")
+                    }
+                }
+            }
+            // try to select sending this element to buffer
+            if (!select.trySelect())
+                return ALREADY_SELECTED
+            size = 1
+            buffer = element
+            return OFFER_SUCCESS
+        }
+        // breaks here if offer meets receiver
+        receive!!.completeResumeReceive(element)
+        return receive!!.offerResult
+    }
+
+    // result is `E | POLL_FAILED | Closed`
+    protected override fun pollInternal(): Any? {
+        var result: Any? = null
+        lock.withLock {
+            if (size == 0) return closedForSend ?: POLL_FAILED // when nothing can be read from buffer
+            // size > 0: not empty -> retrieve element
+            result = buffer
+            buffer = null
+            size = 0
+        }
+        return result
+    }
+
+    // result is `E | POLL_FAILED | Closed`
+    protected override fun pollSelectInternal(select: SelectInstance<*>): Any? = pollInternal()
+
+    // Note: this function is invoked when channel is already closed
+    protected override fun onCancelIdempotent(wasClosed: Boolean) {
+        // clear buffer first, but do not wait for it in helpers
+        if (wasClosed) {
+            lock.withLock {
+                buffer = null
+                size = 0
             }
         }
     }
