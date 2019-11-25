@@ -527,12 +527,17 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         // try to promote it to LIST state with the corresponding state
         val list = NodeList()
         val update = if (state.isActive) list else InactiveNodeList(list)
-        _state.compareAndSet(state, update)
+        if (!_state.compareAndSet(state, update)) {
+            disposeLockFreeLinkedList { list }
+        }
     }
 
     private fun promoteSingleToNodeList(state: JobNode<*>) {
         // try to promote it to list (SINGLE+ state)
-        state.addOneIfEmpty(NodeList())
+        val initialList = NodeList()
+        if (!state.addOneIfEmpty(initialList)) {
+            disposeLockFreeLinkedList { initialList }
+        }
         // it must be in SINGLE+ state or state has changed (node could have need removed from state)
         val list = state.nextNode // either our NodeList or somebody else won the race, updated state
         // just attempt converting it to list if state is still the same, then we'll continue lock-free loop
