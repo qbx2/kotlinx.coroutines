@@ -4,9 +4,11 @@
 
 package kotlinx.coroutines.internal
 
+import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlin.coroutines.*
 import kotlin.coroutines.intrinsics.*
+import kotlin.internal.*
 
 @Suppress("ACTUAL_WITHOUT_EXPECT") // visibility different
 internal actual typealias ShareableRefHolder = Any
@@ -59,7 +61,7 @@ internal actual inline fun <T> ArrayList<T>.addOrUpdate(index: Int, element: T, 
 }
 
 @Suppress("NOTHING_TO_INLINE") // Should be NOP
-internal actual inline fun weakReference(obj: Any): Any = obj
+internal actual inline fun Any.weakRef(): Any = this
 
 @Suppress("NOTHING_TO_INLINE") // Should be NOP
-internal actual inline fun weakReferenceUnwrap(ref: Any?): Any? = ref
+internal actual inline fun Any?.unweakRef(): Any? = this

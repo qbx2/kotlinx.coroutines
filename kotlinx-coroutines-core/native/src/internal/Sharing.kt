@@ -110,9 +110,9 @@ internal actual inline fun <T> ArrayList<T>.addOrUpdate(index: Int, element: T, 
 }
 
 @Suppress("NOTHING_TO_INLINE")
-internal actual inline fun weakReference(obj: Any): Any = WeakReference(obj)
+internal actual inline fun Any.weakRef(): Any = WeakReference(this)
 
-internal actual fun weakReferenceUnwrap(ref: Any?): Any? = (ref as WeakReference<Any>?)?.get()
+internal actual fun Any?.unweakRef(): Any? = (this as WeakReference<Any>?)?.get()
 
 internal open class ShareableObject<T : Any>(obj: T) {
     val thread: Thread = currentThread()

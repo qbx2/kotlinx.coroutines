@@ -6,6 +6,7 @@
 
 package kotlinx.coroutines.internal
 
+import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlin.coroutines.*
 import kotlin.coroutines.intrinsics.*
@@ -77,8 +78,8 @@ internal actual inline fun <T> ArrayList<T>.addOrUpdate(index: Int, element: T, 
 
 @InlineOnly
 @Suppress("NOTHING_TO_INLINE") // Should be NOP
-internal actual inline fun weakReference(obj: Any): Any = obj
+internal actual inline fun Any.weakRef(): Any = this
 
 @InlineOnly
 @Suppress("NOTHING_TO_INLINE") // Should be NOP
-internal actual inline fun weakReferenceUnwrap(ref: Any?): Any? = ref
+internal actual inline fun Any?.unweakRef(): Any? = this

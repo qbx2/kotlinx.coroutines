@@ -22,5 +22,5 @@ internal expect fun <T> CancellableContinuationImpl<T>.shareableResume(delegate:
 internal expect fun isReuseSupportedInPlatform(): Boolean
 internal expect fun <T> ArrayList<T>.addOrUpdate(element: T, update: (ArrayList<T>) -> Unit)
 internal expect fun <T> ArrayList<T>.addOrUpdate(index: Int, element: T, update: (ArrayList<T>) -> Unit)
-internal expect fun weakReference(obj: Any): Any
-internal expect fun weakReferenceUnwrap(ref: Any?): Any?
+internal expect fun Any.weakRef(): Any
+internal expect fun Any?.unweakRef(): Any?

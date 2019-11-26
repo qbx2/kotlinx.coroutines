@@ -265,7 +265,8 @@ public actual open class LockFreeLinkedListNode {
     public actual fun helpRemove() {
         val next = this.next ?: return // unlinked node on Kotlin/Native
         val removed = next as? Removed ?: error("Must be invoked on a removed node")
-        finishRemove(removed.ref)
+        val ref = removed.ref ?: return // unlinked node on Kotlin/Native
+        finishRemove(ref)
     }
 
     public actual fun removeFirstOrNull(): Node? {
@@ -608,7 +609,7 @@ public actual open class LockFreeLinkedListNode {
             val nextNext = next.next ?: return // could be unlinked on Kotlin/Native
             if (nextNext is Removed) {
                 next.markPrev() ?: return // could be unlinked on Kotlin/Native
-                next = nextNext.ref
+                next = nextNext.ref ?: return // could be unlinked on Kotlin/Native
                 continue
             }
             // move the the left until first non-removed node
@@ -616,7 +617,8 @@ public actual open class LockFreeLinkedListNode {
             if (prevNext is Removed) {
                 if (last != null) {
                     prev.markPrev() ?: return // could be unlinked on Kotlin/Native
-                    last._next.compareAndSet(prev, prevNext.ref)
+                    val ref = prevNext.ref ?: return // could be unlinked on Kotlin/Native
+                    last._next.compareAndSet(prev, ref)
                     prev = last
                     last = null
                 } else {
@@ -692,7 +694,9 @@ public actual open class LockFreeLinkedListNode {
     override fun toString(): String = "$classSimpleName@$hexAddress"
 }
 
-private class Removed(@JvmField val ref: Node) {
+private class Removed(ref: Node) {
+    private val wRef: Any = ref.weakRef()
+    val ref: Node? get() = wRef.unweakRef() as Node?
     override fun toString(): String = "Removed[$ref]"
 }
 
