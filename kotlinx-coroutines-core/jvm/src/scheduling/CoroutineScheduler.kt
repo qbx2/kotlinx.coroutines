@@ -334,7 +334,7 @@ internal class CoroutineScheduler(
         globalCpuQueue.close()
         // Finish processing tasks from globalQueue and/or from this worker's local queue
         while (true) {
-            val task = currentWorker?.findTask()
+            val task = currentWorker?.findTask(true)
                 ?: globalCpuQueue.removeFirstOrNull()
                 ?: globalBlockingQueue.removeFirstOrNull()
                 ?: break
@@ -469,10 +469,10 @@ internal class CoroutineScheduler(
          */
         if (worker.state === WorkerState.TERMINATED) return task
         // Do not add CPU tasks in local queue if we are not able to execute it
-        // TODO discuss: maybe add it to the local queue and offload back in the global queue iff permit wasn't acquired?
         if (task.mode == TaskMode.NON_BLOCKING && worker.isBlocking) {
             return task
         }
+        worker.mayHaveLocalTasks = true
         return worker.localQueue.add(task, fair = fair)
     }
 
@@ -658,17 +658,21 @@ internal class CoroutineScheduler(
         }
 
         override fun run() = runWorker()
+        @JvmField
+        var mayHaveLocalTasks = false
 
         private fun runWorker() {
             var rescanned = false
             while (!isTerminated && state != WorkerState.TERMINATED) {
-                val task = findTask()
+                val task = findTask(mayHaveLocalTasks)
                 // Task found. Execute and repeat
                 if (task != null) {
                     rescanned = false
                     minDelayUntilStealableTaskNs = 0L
                     executeTask(task)
                     continue
+                } else {
+                    mayHaveLocalTasks = false
                 }
                 /*
                  * No tasks were found:
@@ -676,7 +680,7 @@ internal class CoroutineScheduler(
                  *    Then its deadline is stored in [minDelayUntilStealableTask]
                  *
                  * Then just park for that duration (ditto re-scanning).
-                 *  While it could potentially lead to short (up to WORK_STEALING_TIME_RESOLUTION_NS ns) starvations,
+                 * While it could potentially lead to short (up to WORK_STEALING_TIME_RESOLUTION_NS ns) starvations,
                  * excess unparks and managing "one unpark per signalling" invariant become unfeasible, instead we are going to resolve
                  * it with "spinning via scans" mechanism.
                  * NB: this short potential parking does not interfere with `tryUnpark`
@@ -684,16 +688,17 @@ internal class CoroutineScheduler(
                 if (minDelayUntilStealableTaskNs != 0L) {
                     if (!rescanned) {
                         rescanned = true
-                        continue
                     } else {
+                        rescanned = false
                         tryReleaseCpu(WorkerState.PARKING)
                         interrupted()
                         LockSupport.parkNanos(minDelayUntilStealableTaskNs)
                         minDelayUntilStealableTaskNs = 0L
                     }
+                    continue
                 }
                 /*
-                 * 2) No tasks available, time to park and, potentially, shut down the thread.
+                 * 2) Or no tasks available, time to park and, potentially, shut down the thread.
                  * Add itself to the stack of parked workers, re-scans all the queues
                  * to avoid missing wake-up (requestCpuWorker) and either starts executing discovered tasks or parks itself awaiting for new tasks.
                  */
@@ -704,20 +709,24 @@ internal class CoroutineScheduler(
 
         // Counterpart to "tryUnpark"
         private fun tryPark() {
-            parkingState.value = PARKING_ALLOWED
+            if (!inStack()) {
+                parkingState.value = PARKING_ALLOWED
+            }
             if (parkedWorkersStackPush(this)) {
                 return
             } else {
                 assert { localQueue.size == 0 }
-                tryReleaseCpu(WorkerState.PARKING)
-                interrupted() // Cleanup interruptions
-                // Failed to get a parking permit, bailout
-                if (!parkingState.compareAndSet(PARKING_ALLOWED, PARKED)) {
-                    return
-                }
-                while (inStack()) { // Prevent spurious wakeups
+                // Failed to get a parking permit => we are not in the stack
+                while (inStack()) {
                     if (isTerminated || state == WorkerState.TERMINATED) break
-                    park()
+                    if (parkingState.value != PARKED && !parkingState.compareAndSet(PARKING_ALLOWED, PARKED)) {
+                        return
+                    }
+                    tryReleaseCpu(WorkerState.PARKING)
+                    interrupted() // Cleanup interruptions
+                    if (inStack()) {
+                        park()
+                    }
                 }
             }
         }
@@ -848,22 +857,30 @@ internal class CoroutineScheduler(
             }
         }
 
-        fun findTask(): Task? {
-            if (tryAcquireCpuPermit()) return findAnyTask()
+        fun findTask(scanLocalQueue: Boolean): Task? {
+            if (tryAcquireCpuPermit()) return findAnyTask(scanLocalQueue)
             // If we can't acquire a CPU permit -- attempt to find blocking task
-            val task =  localQueue.poll() ?: globalBlockingQueue.removeFirstOrNull()
+            val task = if (scanLocalQueue) {
+                localQueue.poll() ?: globalBlockingQueue.removeFirstOrNull()
+            } else {
+                globalBlockingQueue.removeFirstOrNull()
+            }
             return task ?: trySteal(blockingOnly = true)
         }
 
-        private fun findAnyTask(): Task? {
+        private fun findAnyTask(scanLocalQueue: Boolean): Task? {
             /*
              * Anti-starvation mechanism: probabilistically poll either local
              * or global queue to ensure progress for both external and internal tasks.
              */
-            val globalFirst = nextInt(2 * corePoolSize) == 0
-            if (globalFirst) pollGlobalQueues()?.let { return it }
-            localQueue.poll()?.let { return it }
-            if (!globalFirst) pollGlobalQueues()?.let { return it }
+            if (scanLocalQueue) {
+                val globalFirst = nextInt(2 * corePoolSize) == 0
+                if (globalFirst) pollGlobalQueues()?.let { return it }
+                localQueue.poll()?.let { return it }
+                if (!globalFirst) pollGlobalQueues()?.let { return it }
+            } else {
+                pollGlobalQueues()?.let { return it }
+            }
             return trySteal(blockingOnly = false)
         }
 
@@ -887,7 +904,7 @@ internal class CoroutineScheduler(
 
             var currentIndex = nextInt(created)
             var minDelay = Long.MAX_VALUE
-            repeat(created) {
+            repeat(workers.length()) {
                 ++currentIndex
                 if (currentIndex > created) currentIndex = 1
                 val worker = workers[currentIndex]
