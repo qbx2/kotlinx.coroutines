@@ -508,7 +508,6 @@ internal class CoroutineScheduler(
      * E.g. for [1b, 1b, 2c, 1d] means that pool has
      * two blocking workers with queue size 1, one worker with CPU permit and queue size 1
      * and one dormant (executing his local queue before parking) worker with queue size 1.
-     * TODO revisit
      */
     override fun toString(): String {
         var parkedWorkers = 0
@@ -551,10 +550,10 @@ internal class CoroutineScheduler(
                 "running workers queues = $queueSizes, "+
                 "global CPU queue size = ${globalCpuQueue.size}, " +
                 "global blocking queue size = ${globalBlockingQueue.size}, " +
-                "Control State Workers {" +
-                    "created = ${createdWorkers(state)}, " +
-                    "blocking = ${blockingTasks(state)}, " +
-                    "CPU acquired = ${corePoolSize - availableCpuPermits(state)}" +
+                "Control State {" +
+                    "created workers= ${createdWorkers(state)}, " +
+                    "blocking tasks = ${blockingTasks(state)}, " +
+                    "CPUs acquired = ${corePoolSize - availableCpuPermits(state)}" +
                 "}]"
     }
 
@@ -595,7 +594,7 @@ internal class CoroutineScheduler(
          * Worker state. **Updated only by this worker thread**.
          * By default, worker is in DORMANT state in the case when it was created, but all CPU tokens or tasks were taken.
          */
-        @Volatile
+        @JvmField
         var state = WorkerState.DORMANT
         val isBlocking: Boolean get() = state == WorkerState.BLOCKING
 
